@@ -1,18 +1,20 @@
-package io.droptracker.util;
+package io.droptracker.service;
 /* Author: https://github.com/pajlads/DinkPlugin */
 
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
 import com.google.gson.Gson;
 import com.google.gson.JsonSyntaxException;
-import io.droptracker.DropTrackerConfig;
+
 import io.droptracker.DropTrackerPlugin;
-import io.droptracker.models.Drop;
-import lombok.Getter;
+import io.droptracker.models.SerializedDrop;
+import io.droptracker.util.NpcUtilities;
+import io.droptracker.util.Rarity;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.NPC;
 import net.runelite.api.NpcID;
 import net.runelite.client.config.ConfigManager;
+import net.runelite.client.config.RuneLiteConfig;
 import net.runelite.client.events.NpcLootReceived;
 import net.runelite.client.events.PlayerLootReceived;
 import net.runelite.client.game.ItemStack;
@@ -28,12 +30,10 @@ import org.jetbrains.annotations.Nullable;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.Map;
 import java.util.OptionalDouble;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Predicate;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -41,56 +41,47 @@ import java.util.regex.Pattern;
 @Singleton
 public class KCService {
 
-    public static final String GAUNTLET_NAME = "Gauntlet", GAUNTLET_BOSS = "Crystalline Hunllef";
-    public static final String CG_NAME = "Corrupted Gauntlet", CG_BOSS = "Corrupted Hunllef";
-    private static final String TOA = "Tombs of Amascut";
-    private static final String TOB = "Theatre of Blood";
-    private static final String COX = "Chambers of Xeric";
-
 
     private static final String RL_CHAT_CMD_PLUGIN_NAME = ChatCommandsPlugin.class.getSimpleName().toLowerCase();
     private static final String RL_LOOT_PLUGIN_NAME = LootTrackerPlugin.class.getSimpleName().toLowerCase();
     private static final Pattern CLUE_SCROLL_REGEX = Pattern.compile("You have completed (?<scrollCount>\\d+) (?<scrollType>\\w+) Treasure Trails\\.");
 
-    @Inject
-    private static ConfigManager configManager;
+    private ConfigManager configManager;
 
-    private ChatMessageEvent chatMessageEventHandler;
 
-    @Inject
-    private static Gson gson;
+    private Gson gson;
 
     @Inject
     private ScheduledExecutorService executor;
 
+    private Rarity rarityService;
+
     @Inject
-    private static Rarity rarityService;
+    private DropTrackerPlugin plugin;
 
     private static final Cache<String, Integer> killCounts = CacheBuilder.newBuilder()
             .expireAfterAccess(10, TimeUnit.MINUTES)
             .maximumSize(64L)
             .build();
 
-    @Getter
-    @Nullable
-    protected static Drop lastDrop = null;
 
     @Inject
     public KCService(ConfigManager configManager, Gson gson,
                      ScheduledExecutorService executor,
-                     ChatMessageEvent chatMessageEventHandler,
-                     Rarity rarityService) {
+                     Rarity rarityService, DropTrackerPlugin plugin) {
         this.configManager = configManager;
         this.gson = gson;
-        this.chatMessageEventHandler = chatMessageEventHandler;
         this.rarityService = rarityService;
+        this.executor = executor;
+        this.plugin = plugin;
     }
 
     public void reset() {
-        this.lastDrop = null;
-        this.killCounts.invalidateAll();
+        plugin.lastDrop = null;
+        KCService.killCounts.invalidateAll();
     }
 
+    @SuppressWarnings("deprecation")
     public void onNpcKill(NpcLootReceived event) {
         NPC npc = event.getNpc();
         int id = npc.getId();
@@ -101,7 +92,7 @@ public class KCService {
         }
 
         String name = npc.getName();
-        if (GAUNTLET_BOSS.equals(name) || CG_BOSS.equals(name)) {
+        if (NpcUtilities.GAUNTLET_BOSS.equals(name) || NpcUtilities.CG_BOSS.equals(name)) {
             // already handled by onGameMessage
             return;
         }
@@ -133,7 +124,7 @@ public class KCService {
         }
 
         if (increment) {
-            this.incrementKills(event.getType(), getStandardizedSource(event), event.getItems());
+            this.incrementKills(event.getType(), NpcUtilities.getStandardizedSource(event, plugin), event.getItems());
         }
     }
 
@@ -147,7 +138,7 @@ public class KCService {
             return;
         }
 
-        chatMessageEventHandler.parseBoss(message).ifPresent(pair -> {
+        NpcUtilities.parseBoss(message, plugin).ifPresent(pair -> {
             String boss = pair.getKey();
             Integer kc = pair.getValue();
 
@@ -155,11 +146,10 @@ public class KCService {
             String cacheKey = getCacheKey(LootRecordType.UNKNOWN, boss);
             killCounts.asMap().merge(cacheKey, kc - 1, Math::max);
 
-            if (boss.equals(GAUNTLET_BOSS) || boss.equals(CG_BOSS) || boss.startsWith(TOA) || boss.startsWith(TOB) || boss.startsWith(COX)) {
+            if (boss.equals(NpcUtilities.GAUNTLET_BOSS) || boss.equals(NpcUtilities.CG_BOSS) || boss.startsWith(NpcUtilities.TOA) || boss.startsWith(NpcUtilities.TOB) || boss.startsWith(NpcUtilities.COX)) {
                 // populate lastDrop to workaround loot tracker quirks
-                this.lastDrop = new Drop(boss, LootRecordType.EVENT, Collections.emptyList());
 
-                if (!ConfigUtilities.isPluginDisabled(configManager, RL_LOOT_PLUGIN_NAME)) {
+                if (!isPluginDisabled(RL_LOOT_PLUGIN_NAME)) {   
                     // onLoot will already increment kc, no need to schedule task below.
                     // this early return also simplifies our test code
                     return;
@@ -169,41 +159,24 @@ public class KCService {
             // However: we don't know if boss message appeared before/after the loot event.
             // If after, we should store kc. If before, we should store kc - 1.
             // Given this uncertainty, we wait so that the loot event has passed, and then we can store latest kc.
+
+            
+            /* -- We are using the executor here -- */
             executor.schedule(() -> {
                 killCounts.asMap().merge(cacheKey, kc, Math::max);
             }, 15, TimeUnit.SECONDS);
         });
     }
 
-    public String getStandardizedSource(LootReceived event) {
-        if (isCorruptedGauntlet(event)) {
-            return KCService.CG_NAME;
-        } else if (lastDrop != null && shouldUseChatName(event)) {
-            return lastDrop.getSource(); // distinguish entry/expert/challenge modes
-        }
-        return event.getName();
-    }
-
-    private boolean shouldUseChatName(LootReceived event) {
-        assert lastDrop != null;
-        String lastSource = lastDrop.getSource();
-        Predicate<String> coincides = source -> source.equals(event.getName()) && lastSource.startsWith(source);
-        return coincides.test(TOA) || coincides.test(TOB) || coincides.test(COX);
-    }
-
-    /**
-     * @param event a loot received event that was just fired
-     * @return whether the event represents corrupted gauntlet
-     * @apiNote Useful to distinguish normal vs. corrupted gauntlet since the base loot tracker plugin does not,
-     * which was <a href="https://github.com/pajlads/DinkPlugin/issues/469">reported</a> to our issue tracker.
-     */
-    private boolean isCorruptedGauntlet(LootReceived event) {
-        return event.getType() == LootRecordType.EVENT && lastDrop != null && "The Gauntlet".equals(event.getName())
-                && (CG_NAME.equals(lastDrop.getSource()) || CG_BOSS.equals(lastDrop.getSource()));
+    @Nullable
+    public Integer getKillCount(LootRecordType type, String sourceName) {
+        if (sourceName == null) return null;
+        // This static method is deprecated - use instance method instead
+        return killCounts.getIfPresent(getCacheKey(type, sourceName));
     }
 
     @Nullable
-    public static Integer getKillCount(LootRecordType type, String sourceName) {
+    public Integer getKillCountWithStorage(LootRecordType type, String sourceName) {
         if (sourceName == null) return null;
         Integer stored = getStoredKillCount(type, sourceName);
         if (stored != null) {
@@ -225,7 +198,6 @@ public class KCService {
                 return kc != null ? kc + 1 : null;
             }
         });
-        this.lastDrop = new Drop(sourceName, type, items);
     }
 
     /**
@@ -234,16 +206,16 @@ public class KCService {
      * @return the kill count stored by base runelite plugins
      */
     @Nullable
-    private static Integer getStoredKillCount(@NotNull LootRecordType type, @NotNull String sourceName) {
+    private Integer getStoredKillCount(@NotNull LootRecordType type, @NotNull String sourceName) {
         // get kc from base runelite chat commands plugin (if enabled)
-        if (!ConfigUtilities.isPluginDisabled(configManager, RL_CHAT_CMD_PLUGIN_NAME)) {
+        if (!isPluginDisabled(RL_CHAT_CMD_PLUGIN_NAME)) {
             Integer kc = configManager.getRSProfileConfiguration("killcount", cleanBossName(sourceName), int.class);
             if (kc != null) {
                 return kc - 1; // decremented since chat event typically occurs before loot event
             }
         }
 
-        if (ConfigUtilities.isPluginDisabled(configManager, RL_LOOT_PLUGIN_NAME)) {
+        if (isPluginDisabled(RL_LOOT_PLUGIN_NAME)) {
             // assume stored kc is useless if loot tracker plugin is disabled
             return null;
         }
@@ -295,8 +267,8 @@ public class KCService {
             case PLAYER:
                 return "player_" + sourceName;
             default:
-                if ("The Gauntlet".equals(sourceName)) return GAUNTLET_BOSS;
-                if (CG_NAME.equals(sourceName)) return CG_BOSS;
+                if ("The Gauntlet".equals(sourceName)) return NpcUtilities.GAUNTLET_BOSS;
+                if (NpcUtilities.CG_NAME.equals(sourceName)) return NpcUtilities.CG_BOSS;
                 return sourceName;
         }
     }
@@ -312,5 +284,9 @@ public class KCService {
     public String ucFirst(@NotNull String text) {
         if (text.length() < 2) return text.toUpperCase();
         return Character.toUpperCase(text.charAt(0)) + text.substring(1).toLowerCase();
+    }
+
+    protected boolean isPluginDisabled(String simpleLowerClassName) {
+        return "false".equals(configManager.getConfiguration(RuneLiteConfig.GROUP_NAME, simpleLowerClassName));
     }
 }
